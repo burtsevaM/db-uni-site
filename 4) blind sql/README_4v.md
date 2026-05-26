@@ -95,6 +95,54 @@
 
 Основная проблема находилась в SQL-функции `training.run_custom_report(raw_where_clause text)`. В ней пользовательский фрагмент подставлялся в запрос через `format(... WHERE %s ...)` и выполнялся через `EXECUTE`. Поэтому введенный текст становился частью SQL-команды:
 
+### Код до исправления
+
+Серверная функция принимала строку `whereClause` и передавала ее в базу как параметр. На этом уровне параметризация выглядела безопасно, но дальше в базе строка использовалась как SQL-фрагмент:
+
+```typescript
+export async function runCustomReport(whereClause: string) {
+    if (!whereClause.trim()) {
+        error(400, 'WHERE clause is required');
+    }
+
+    const result = await pool.query('SELECT * FROM training.run_custom_report($1)', [whereClause]);
+    return result.rows;
+}
+```
+
+В SQL-функции `raw_where_clause` попадал в `format(... WHERE %s ...)` и выполнялся через `EXECUTE`:
+
+```sql
+CREATE OR REPLACE FUNCTION training.run_custom_report(raw_where_clause text)
+RETURNS TABLE (
+    customer_name text,
+    amount numeric,
+    owner_name text,
+    card_hint text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    RETURN QUERY EXECUTE format(
+        'SELECT c.full_name, i.amount, u.full_name, i.card_hint
+         FROM training.invoices i
+         JOIN training.customers c ON c.id = i.customer_id
+         JOIN training.app_users u ON u.id = i.owner_user_id
+         WHERE %s
+         ORDER BY i.id',
+        raw_where_clause
+    );
+END;
+$$;
+```
+
+Дополнительно у роли приложения был включен обход RLS:
+
+```sql
+ALTER ROLE app_user BYPASSRLS;
+```
+
 ![Уязвимая SQL-функция отчета](<./Снимок экрана 2026-05-26 в 3.46.22 PM.png>)
 
 Дополнительно роль `app_user` имела `BYPASSRLS`, то есть могла обходить политики Row Level Security:
@@ -109,6 +157,65 @@
 
 В серверном коде появилась структура фильтров, а вызов отчета стал параметризованным:
 
+### Код после исправления
+
+В серверном коде появились конкретные поля фильтрации. Значения передаются в SQL-функцию отдельными параметрами, а не склеиваются в условие `WHERE`:
+
+```typescript
+type ReportFilters = {
+    ownerUsername?: string;
+    status?: string;
+    minAmount?: number | null;
+};
+
+export async function runCustomReport(filters: ReportFilters) {
+    const ownerUsername = filters.ownerUsername?.trim() || null;
+    const status = filters.status?.trim() || null;
+    const minAmount = filters.minAmount ?? null;
+
+    const result = await pool.query(
+        'SELECT * FROM training.run_custom_report($1, $2, $3)',
+        [ownerUsername, status, minAmount]
+    );
+
+    return result.rows;
+}
+```
+
+Обработчик формы проверяет статус и отдельно приводит минимальную сумму к числу:
+
+```typescript
+const ownerUsername = String(form.get('ownerUsername') ?? '').trim();
+const status = String(form.get('status') ?? '').trim();
+const minAmountRaw = String(form.get('minAmount') ?? '').trim();
+
+if (status && !allowedStatuses.has(status)) {
+    return fail(400, {
+        ownerUsername,
+        status,
+        minAmount: minAmountRaw,
+        error: 'Недопустимый статус отчета'
+    });
+}
+
+const minAmount = minAmountRaw ? Number(minAmountRaw) : null;
+
+if (minAmountRaw && Number.isNaN(minAmount)) {
+    return fail(400, {
+        ownerUsername,
+        status,
+        minAmount: minAmountRaw,
+        error: 'Минимальная сумма должна быть числом'
+    });
+}
+
+const results = await runCustomReport({
+    ownerUsername,
+    status,
+    minAmount
+});
+```
+
 ![Параметризованный вызов отчета](<./Снимок экрана 2026-05-26 в 3.47.54 PM.png>)
 
 В обработчике формы теперь отдельно читаются поля `ownerUsername`, `status` и `minAmount`. Статус проверяется по списку разрешенных значений, а минимальная сумма приводится к числу:
@@ -117,9 +224,40 @@
 
 SQL-функция отчета тоже была переписана. Она больше не принимает `raw_where_clause` и не выполняет динамический SQL через `EXECUTE`. Вместо этого она принимает обычные параметры и использует их в статическом запросе:
 
+```sql
+CREATE OR REPLACE FUNCTION training.run_custom_report(
+    report_owner_username text DEFAULT NULL,
+    report_status text DEFAULT NULL,
+    min_amount numeric DEFAULT NULL
+)
+RETURNS TABLE (
+    customer_name text,
+    amount numeric,
+    owner_name text,
+    card_hint text
+)
+LANGUAGE sql
+SECURITY INVOKER
+AS $$
+    SELECT c.full_name, i.amount, u.full_name, i.card_hint
+    FROM training.invoices i
+    JOIN training.customers c ON c.id = i.customer_id
+    JOIN training.app_users u ON u.id = i.owner_user_id
+    WHERE
+        (report_owner_username IS NULL OR u.username = report_owner_username)
+        AND (report_status IS NULL OR i.status = report_status)
+        AND (min_amount IS NULL OR i.amount >= min_amount)
+    ORDER BY i.id;
+$$;
+```
+
 ![Исправленная SQL-функция отчета](<./Снимок экрана 2026-05-26 в 3.46.52 PM.png>)
 
 Также для роли `app_user` был отключен обход RLS:
+
+```sql
+ALTER ROLE app_user NOBYPASSRLS;
+```
 
 ![Отключение обхода RLS](<./Снимок экрана 2026-05-26 в 3.47.12 PM.png>)
 

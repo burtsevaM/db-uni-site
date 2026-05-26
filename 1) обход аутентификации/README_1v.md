@@ -45,9 +45,80 @@ form.appendChild(input);
 
 В исправлении поле `roleName` больше не берется из формы профиля и не передается в функцию обновления пользователя.
 
+### Код до исправления
+
+В обработчике профиля сервер читал роль из `FormData` и передавал ее дальше вместе с остальными полями профиля:
+
+```typescript
+const form = await request.formData();
+const fullName = String(form.get('fullName') ?? '').trim();
+const email = String(form.get('email') ?? '').trim();
+const roleName = String(form.get('roleName') ?? '').trim();
+
+await updateUserProfile(userId, {
+    fullName,
+    email,
+    roleName: roleName || undefined
+});
+```
+
+В запросе к базе это поле попадало в обновление роли пользователя:
+
+```typescript
+await pool.query(
+    `
+        UPDATE training.app_users
+        SET full_name = $1,
+            email = $2,
+            role = $3
+        WHERE id = $4
+    `,
+    [fields.fullName, fields.email, roleName, userId]
+);
+```
+
 ![Исправление обработчика профиля](./fix1.png)
 
 Также в запросе к базе данных обновляются только разрешенные поля профиля: имя и email. Роль пользователя больше не обновляется через этот маршрут.
+
+### Код после исправления
+
+После исправления строки, которые читали `roleName` из формы, были убраны из рабочей логики. В обработчике остаются только поля, которые пользователь действительно может менять:
+
+```typescript
+const form = await request.formData();
+const fullName = String(form.get('fullName') ?? '').trim();
+const email = String(form.get('email') ?? '').trim();
+// const roleName = String(form.get('roleName') ?? '').trim();
+
+await updateUserProfile(userId, {
+    fullName,
+    email
+});
+```
+
+Функция обновления профиля тоже больше не принимает роль и не записывает ее в таблицу:
+
+```typescript
+export async function updateUserProfile(
+    userId: string,
+    fields: {
+        fullName: string;
+        email: string;
+        // roleName?: string;
+    }
+) {
+    await pool.query(
+        `
+            UPDATE training.app_users
+            SET full_name = $1,
+                email = $2
+            WHERE id = $3
+        `,
+        [fields.fullName, fields.email, userId]
+    );
+}
+```
 
 ![Исправление запроса к базе данных](./fix2.png)
 

@@ -50,7 +50,35 @@ ok: true
 
 Из-за этого любой авторизованный пользователь мог отправить запрос на маршрут `/api/users/{id}/profile` с чужим id и обновить профиль другого пользователя.
 
-Код до исправления:
+### Код до исправления
+
+```typescript
+export async function POST({ locals, params, request }) {
+    if (!locals.user) {
+        redirect(303, '/login');
+    }
+
+    const userId = params.id.trim();
+    if (!userId) {
+        error(400, 'Invalid user id');
+    }
+
+    const form = await request.formData();
+    const fullName = String(form.get('fullName') ?? '').trim();
+    const email = String(form.get('email') ?? '').trim();
+
+    await updateUserProfile(userId, {
+        fullName,
+        email
+    });
+
+    return json({
+        ok: true
+    });
+}
+```
+
+В этом варианте `userId` полностью зависел от `params.id`, то есть от id в URL. Сессия проверялась только на наличие пользователя, но не связывалась с тем id, который обновлялся.
 
 ![Код до исправления](<./Снимок экрана 2026-05-26 в 6.49.27 PM.png>)
 
@@ -60,7 +88,40 @@ ok: true
 
 Также обновление профиля выполняется для `locals.user.id`, то есть для пользователя из текущей сессии, а не для произвольного id из URL.
 
-Код после исправления:
+### Код после исправления
+
+```typescript
+export async function POST({ locals, params, request }) {
+    if (!locals.user) {
+        throw error(401, 'Unauthorized');
+    }
+
+    const routeUserId = params.id.trim();
+
+    if (!routeUserId) {
+        throw error(400, 'Invalid user id');
+    }
+
+    if (routeUserId !== locals.user.id) {
+        throw error(403, 'Forbidden: you can update only your own profile');
+    }
+
+    const form = await request.formData();
+    const fullName = String(form.get('fullName') ?? '').trim();
+    const email = String(form.get('email') ?? '').trim();
+
+    await updateUserProfile(locals.user.id, {
+        fullName,
+        email
+    });
+
+    return json({
+        ok: true
+    });
+}
+```
+
+Теперь id из маршрута используется только для проверки соответствия текущей сессии. Само обновление выполняется по `locals.user.id`, поэтому пользователь не может выбрать чужой профиль через URL.
 
 ![Код после исправления](<./Снимок экрана 2026-05-26 в 6.49.33 PM.png>)
 
